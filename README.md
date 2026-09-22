@@ -13,10 +13,10 @@ Group project: a machine learning system trained on a real UAV testbed dataset t
 
 | Name | Responsibility |
 |---|---|
-| Tracey Parks | Project Overview, Problem, Motivation slides |
-| Savion Parks | TBD |
-| Robert Kosie-Williams | TBD |
-| Malachi Bullock | TBD |
+| Jamari Ingram | Group Leader |
+| Savion Parks | Coding / database |
+| Robert Kosie-Williams | Coding / database |
+| Malachi Bullock | Coding / database |
 
 ## Repo structure
 
