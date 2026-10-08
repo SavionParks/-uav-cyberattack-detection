@@ -1,6 +1,6 @@
-pandas
+tensorflow
+ultralytics
+opencv-python
 numpy
-scikit-learn
 matplotlib
-seaborn
-jupyter
+pillow
