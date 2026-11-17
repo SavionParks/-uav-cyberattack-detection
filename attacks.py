@@ -11,12 +11,17 @@ Contains:
       - noise: random +/- eps noise (a control: "is it just noise?")
       - fgsm:  Fast Gradient Sign Method, one gradient step
       - pgd:   Projected Gradient Descent, several smaller gradient steps
+    plus
+      - cw:    Carlini-Wagner L2, searches for the SMALLEST change that fools the model
+               (no eps limit; see the CW_ settings)
     and two goals:
       - "hide": make the detector miss signs
-      - "swap": make a 45 mph sign read as 35 mph (or 35 as 45)
+      - "swap": make a sign read as a different sign (stop -> 45, 45 -> 35, 35 -> 45; see SWAP_TO)
 
 These are digital attacks on your own model, for robustness testing only.
 """
+import math
+
 import cv2
 import numpy as np
 import torch
@@ -27,8 +32,29 @@ try:
 except ImportError:  # older ultralytics versions
     from ultralytics.utils.ops import non_max_suppression
 
-ATTACKS = ["off", "noise", "fgsm", "pgd"]
+ATTACKS = ["off", "noise", "fgsm", "pgd", "cw"]
 GOALS = ["hide", "swap"]
+
+# ---- Carlini-Wagner (C&W) L2 settings ----
+CW_STEPS = 20        # optimisation steps per image (more = smaller change, slower)
+CW_C = 2.0           # how much "fool the model" matters vs. "keep the change small"
+CW_LR = 0.02         # step size of the optimiser
+CW_KAPPA = 0.5       # swap: how far the new sign must beat the real one
+CW_HIDE_SCORE = 0.2  # hide: push every sign score below this
+CW_SWAP_SCORE = 0.6  # swap: push the new sign above this (matches the camera's CONF)
+
+# What each sign should turn into for the "swap" goal. Change these if you like,
+# e.g. "STOP": "35". Any sign not listed here is turned into the model's 2nd-best guess.
+SWAP_TO = {
+    "STOP": "45",   # stop sign  -> 45 mph
+    "45": "35",     # 45 mph     -> 35 mph
+    "35": "45",     # 35 mph     -> 45 mph
+}
+SWAP_TARGET_WEIGHT = 3.0   # how hard swap pushes the NEW sign up vs. the real sign down
+
+
+def _logit(p):
+    return math.log(p / (1 - p))
 
 
 def sign_kind(name):
@@ -49,9 +75,30 @@ class SignModel:
         self.net = self.yolo.model.float().eval()
         for p in self.net.parameters():
             p.requires_grad_(False)
+        # YOLO26 (and YOLOv10) are "end-to-end": by default they output a short finished
+        # list of boxes instead of the raw per-spot class scores the attacks need.
+        # Switch them to their regular head, which gives the same raw scores as YOLO11.
+        head = self.net.model[-1] if hasattr(self.net, "model") else None
+        if head is not None and getattr(head, "end2end", False):
+            try:
+                head.end2end = False
+                print("YOLO26-style model: using its regular (raw score) head for the attacks.")
+            except Exception:
+                pass
         self.names = self.yolo.names
         self.imgsz = int(imgsz)
         self.kind_to_idx = {sign_kind(v): k for k, v in self.names.items()}
+        self._check_output()
+
+    def _check_output(self):
+        """Make sure the model gives raw scores shaped (1, 4 + classes, spots)."""
+        with torch.no_grad():
+            pred, _ = self.class_scores(torch.zeros(1, 3, 320, 320))
+        nc = len(self.names)
+        if pred.dim() != 3 or pred.shape[1] != 4 + nc:
+            raise RuntimeError(
+                f"This model's output has shape {tuple(pred.shape)}, but the attacks expect "
+                f"(1, {4 + nc}, N). Send this message to get attacks.py updated for this model.")
 
     # ----- image <-> tensor -------------------------------------------------
     def to_tensor(self, frame):
@@ -100,17 +147,26 @@ class SignModel:
 
     # ----- attacks ----------------------------------------------------------
     def _swap_pair(self, x):
-        """Decide the swap direction from the clean image: 45 -> 35, or 35 -> 45 (None if no speed limit sign)."""
-        i35, i45 = self.kind_to_idx.get("35"), self.kind_to_idx.get("45")
-        if i35 is None or i45 is None:
-            raise ValueError("Swap attack needs a model with both 35 and 45 mph classes.")
+        """Decide the swap from the clean image: find the sign in view and pick what to turn it into
+        (see SWAP_TO). Returns None if no sign is in view."""
+        if len(self.names) < 2:
+            raise ValueError("Swap attack needs a model with at least two classes.")
         with torch.no_grad():
             _, cls = self.class_scores(x)
-        if max(cls[0, i45].max(), cls[0, i35].max()) < 0.25:
-            return None  # no speed limit sign in view: nothing to swap
-        src = i45 if cls[0, i45].max() >= cls[0, i35].max() else i35
-        tgt = i35 if src == i45 else i45
-        anchors = cls[0, src].topk(min(50, cls.shape[2])).indices
+        best_per_class = cls[0].max(dim=1).values          # strongest score of each class anywhere
+        src = int(best_per_class.argmax())
+        if best_per_class[src] < 0.25:
+            return None  # no sign in view: nothing to swap
+        tgt = self.kind_to_idx.get(SWAP_TO.get(sign_kind(self.names[src])))
+        if tgt is None or tgt == src:
+            # sign type not in SWAP_TO (or target class missing): use the model's 2nd-best guess
+            order = best_per_class.argsort(descending=True).tolist()
+            tgt = next(i for i in order if i != src)
+        # Only the spots that are actually ON the sign (score at least half of the best spot).
+        # Before, it took the 50 best spots even if some were far away on the wall or your
+        # hand, so the swap made new "35"/"45" boxes pop up in random places.
+        top = cls[0, src].topk(min(50, cls.shape[2]))
+        anchors = top.indices[top.values >= 0.5 * top.values[0]]
         return src, tgt, anchors
 
     def _loss(self, x, goal, pair=None):
@@ -120,9 +176,18 @@ class SignModel:
         if goal == "hide":
             # push down the strongest sign scores anywhere in the image
             return cls.flatten().topk(min(100, cls.numel())).values.sum()
-        # "swap": lower the real speed limit's score and raise the other one, on the sign itself
+        # "swap": on the sign itself, train the scores toward "target = yes, real sign = no".
+        # The model's scores are already squashed to 0-1 (sigmoid). Subtracting those
+        # directly gave almost no push to the target class while it was near 0, so the
+        # attack mostly just lowered the real sign and the box vanished instead of flipping.
+        # Undoing the squash (logit) and using a cross-entropy loss gives the target class
+        # a strong push even when its score starts near zero.
         src, tgt, a = pair
-        return (cls[src, a] - cls[tgt, a]).sum()
+        z_src = torch.logit(cls[src, a], eps=1e-6)
+        z_tgt = torch.logit(cls[tgt, a], eps=1e-6)
+        # The "raise the target" part is weighted 3x so a single FGSM step mostly builds up the
+        # new sign instead of just erasing the old one (which made the box vanish).
+        return (torch.nn.functional.softplus(z_src) + SWAP_TARGET_WEIGHT * torch.nn.functional.softplus(-z_tgt)).sum()
 
     def _grad(self, x, goal, pair=None):
         x = x.clone().requires_grad_(True)
@@ -158,7 +223,55 @@ class SignModel:
             x_adv = (x + (x_adv - x).clamp(-eps, eps)).clamp(0, 1)
         return self._finish(x_adv)
 
-    def attack(self, kind, x, meta, eps, goal="hide", steps=10):
+    def _cw_fooled_score(self, x, goal, pair=None):
+        """C&W's 'how far from fooled' number: 0 once the goal is reached, bigger = further away.
+        hide: every sign score on the image must drop below CW_HIDE_SCORE.
+        swap: on the sign, the new sign must beat the real one AND reach CW_SWAP_SCORE."""
+        _, cls = self.class_scores(x)
+        cls = cls[0]
+        if goal == "hide":
+            top = torch.logit(cls.flatten().topk(min(100, cls.numel())).values, eps=1e-6)
+            return torch.relu(top - _logit(CW_HIDE_SCORE)).sum()
+        src, tgt, a = pair
+        z_src = torch.logit(cls[src, a], eps=1e-6)
+        z_tgt = torch.logit(cls[tgt, a], eps=1e-6)
+        beat = torch.relu(z_src - z_tgt + CW_KAPPA)
+        sure = torch.relu(_logit(CW_SWAP_SCORE) - z_tgt)
+        return (beat + sure).mean() * len(a) ** 0.5
+
+    def cw(self, x, meta, goal="hide", steps=None, c=None, lr=None):
+        """Carlini-Wagner L2: search for the SMALLEST change that fools the model.
+        There is no epsilon limit; instead it minimises   size_of_change^2 + c * how_far_from_fooled.
+        Works in tanh space so pixels always stay inside 0-1."""
+        steps = steps or CW_STEPS
+        c = CW_C if c is None else c
+        lr = lr or CW_LR
+        pair = self._swap_pair(x) if goal == "swap" else None
+        if goal == "swap" and pair is None:
+            return x
+        mask = meta["mask"]
+        w = torch.atanh((x * 2 - 1).clamp(-1 + 1e-6, 1 - 1e-6)).detach().requires_grad_(True)
+        opt = torch.optim.Adam([w], lr=lr)
+        best, best_size = None, float("inf")
+        for _ in range(steps):
+            cand = 0.5 * (torch.tanh(w) + 1)
+            x_adv = x * (1 - mask) + cand * mask          # never change the grey padding
+            size = ((x_adv - x) ** 2).sum()
+            f = self._cw_fooled_score(x_adv, goal, pair)
+            loss = size + c * f
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if f.item() == 0 and size.item() < best_size:  # fooled: remember the smallest such change
+                best, best_size = x_adv.detach().clone(), size.item()
+        if best is None:
+            with torch.no_grad():
+                best = x * (1 - mask) + 0.5 * (torch.tanh(w) + 1) * mask
+        return self._finish(best)
+
+    def attack(self, kind, x, meta, eps, goal="hide", steps=10, cw_steps=None):
+        if kind == "cw":
+            return self.cw(x, meta, goal, steps=cw_steps)   # C&W picks its own size: eps is not used
         if kind == "off" or eps <= 0:
             return x
         if kind == "noise":

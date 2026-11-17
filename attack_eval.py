@@ -16,8 +16,13 @@ and any new detection that wasn't there before is a "phantom".
 Output (in the "attack_results" folder):
     results.csv          every number, per attack / epsilon / sign type
     detection_rate.png   chart like the team's Figure 2
-    flip_rate.png        (swap goal) how often 35/45 get switched
-    examples_eps*.png    clean vs noise vs FGSM vs PGD on one test image
+    attack_success.png   attack success rate vs epsilon (hide: sign lost; swap: sign read as another sign)
+    flip_rate.png        (swap goal) how often a sign is read as a different sign
+    examples_eps*.png    clean vs noise vs FGSM vs PGD vs C&W on one test image
+    results_cw_*.csv     C&W (Carlini-Wagner L2) results, with how big its change was
+
+C&W has no epsilon: it searches for the smallest change that fools the model, so it is
+run once (not swept) and shown as a flat dashed line on the charts.
 """
 import argparse
 import csv
@@ -28,12 +33,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from attacks import SignModel, sign_kind
+from attacks import CW_STEPS, SignModel, sign_kind
 
 # ------------------------------- SETTINGS --------------------------------
 WEIGHTS = ""                  # empty = auto-find the .pt file next to this script / in Downloads
 SOURCE = "test_images"        # a folder of pictures, or a video file (e.g. "drive.mp4")
-GOAL = "hide"                 # "hide" = make signs disappear, "swap" = make 35 <-> 45
+GOAL = "hide"                 # "hide" = make signs disappear, "swap" = make a sign read as another sign
 EPSILONS = [0.00, 0.01, 0.03, 0.05, 0.10, 0.15, 0.20, 0.30]   # same sweep as the team's report
 PGD_STEPS = 10
 CONF = 0.35                   # confidence needed to count as a detection
@@ -42,6 +47,7 @@ VIDEO_EVERY = 15              # for videos: test every Nth frame
 MAX_IMAGES = 40               # cap so the run finishes in reasonable time
 EXAMPLE_EPS = 0.03            # epsilon used for the example picture
 OUT_DIR = "attack_results"
+RUN_CW = True                 # also run Carlini-Wagner L2 (slower: CW_STEPS steps per image)
 # -------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -121,6 +127,13 @@ def compare(ref, adv):
     return outcomes, len(adv) - len(used)
 
 
+def success(st, goal):
+    """Attack success rate. hide: sign no longer read correctly (missed or flipped).
+    swap: sign read as a different sign (flipped). Both divided by signs found on the clean image."""
+    n = st["signs"]
+    return (st["flipped"] if goal == "swap" else st["flipped"] + st["missed"]) / n if n else 0.0
+
+
 def draw(img, dets, title):
     img = img.copy()
     for x1, y1, x2, y2, kind, s in dets:
@@ -154,13 +167,11 @@ def main():
     for name, img in images:
         x, meta = model.to_tensor(img)
         ref = run(x, meta)
-        if args.goal == "swap":
-            ref = [d for d in ref if d[4] in ("35", "45")]
         if ref:
             prepared.append((name, img, x, meta, ref))
     if not prepared:
         sys.exit("The model didn't detect any signs in the clean images, so there is nothing to attack.\n"
-                 "Use clearer or closer sign photos (for swap: photos with 35 or 45 mph signs).")
+                 "Use clearer or closer sign photos.")
     n_signs = sum(len(p[4]) for p in prepared)
     print(f"{len(prepared)} of {len(images)} images have detections ({n_signs} signs). Goal: {args.goal.upper()}")
 
@@ -191,7 +202,8 @@ def main():
                     example_imgs[kind] = draw(shown, adv, f"{kind.upper()} eps={eps:.2f}")
             done += 1
             st = stats[(kind, eps, "ALL")]
-            print(f"[{done:2d}/{total}] {kind:5s} eps={eps:.2f}  detected {st['kept'] / st['signs']:6.1%}"
+            print(f"[{done:2d}/{total}] {kind:5s} eps={eps:.2f}  SUCCESS {success(st, args.goal):6.1%}"
+                  f"  detected {st['kept'] / st['signs']:6.1%}"
                   f"  flipped {st['flipped'] / st['signs']:6.1%}  missed {st['missed'] / st['signs']:6.1%}"
                   f"  ({time.time() - t0:.0f}s)")
 
@@ -199,29 +211,77 @@ def main():
     csv_path = out_dir / f"results_{args.goal}.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["goal", "attack", "epsilon", "sign_type", "signs", "detection_rate", "flip_rate",
-                    "miss_rate", "phantoms_per_image"])
+        w.writerow(["goal", "attack", "epsilon", "sign_type", "signs", "attack_success_rate", "detection_rate",
+                    "flip_rate", "miss_rate", "phantoms_per_image"])
         for (kind, eps, sk), st in sorted(stats.items(), key=lambda t: (t[0][0], t[0][1], t[0][2])):
             n = st["signs"]
-            w.writerow([args.goal, kind, eps, sk, n, round(st["kept"] / n, 4), round(st["flipped"] / n, 4),
+            w.writerow([args.goal, kind, eps, sk, n, round(success(st, args.goal), 4),
+                        round(st["kept"] / n, 4), round(st["flipped"] / n, 4),
                         round(st["missed"] / n, 4),
                         round(st["phantoms"] / st["images"], 3) if sk == "ALL" else ""])
     print(f"Saved {csv_path}")
+
+    # ---- C&W: run once (it chooses its own size) ----
+    cw = None
+    if RUN_CW:
+        cw = dict(signs=0, kept=0, flipped=0, missed=0, phantoms=0, images=0, l2=[], max255=[], avg255=[])
+        cw_by_kind = {}
+        for idx, (name, img, x, meta, ref) in enumerate(prepared):
+            x_adv = model.cw(x, meta, args.goal)
+            adv = run(x_adv, meta)
+            outcomes, phantoms = compare(ref, adv)
+            for k2, res in outcomes:
+                cw["signs"] += 1; cw[res] += 1
+                kk = cw_by_kind.setdefault(k2, dict(signs=0, kept=0, flipped=0, missed=0))
+                kk["signs"] += 1; kk[res] += 1
+            cw["phantoms"] += phantoms; cw["images"] += 1
+            d = (x_adv - x) * meta["mask"]
+            cw["l2"].append(float(d.pow(2).sum().sqrt()))
+            cw["max255"].append(float(d.abs().max()) * 255)
+            cw["avg255"].append(float(d.abs().sum() / (meta["mask"].sum())) * 255)
+            if idx == 0:
+                shown = model.add_perturbation(img, x, x_adv, meta)
+                example_imgs["cw"] = draw(shown, adv, "C&W (smallest change)")
+        n = cw["signs"]
+        print(f"[C&W] {CW_STEPS} steps  SUCCESS {success(cw, args.goal):6.1%}  detected {cw['kept'] / n:6.1%}  flipped {cw['flipped'] / n:6.1%}"
+              f"  missed {cw['missed'] / n:6.1%}  avg change {np.mean(cw['avg255']):.2f}/255"
+              f"  (max {np.mean(cw['max255']):.1f}/255)  ({time.time() - t0:.0f}s)")
+        cw_path = out_dir / f"results_cw_{args.goal}.csv"
+        with open(cw_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["goal", "attack", "sign_type", "signs", "attack_success_rate", "detection_rate",
+                        "flip_rate", "miss_rate",
+                        "avg_pixel_change_255", "avg_max_pixel_change_255", "avg_l2"])
+            rows = [("ALL", cw)] + sorted(cw_by_kind.items())
+            for sk, st in rows:
+                m = st["signs"]
+                w.writerow([args.goal, "cw", sk, m, round(success(st, args.goal), 4), round(st["kept"] / m, 4), round(st["flipped"] / m, 4),
+                            round(st["missed"] / m, 4),
+                            round(float(np.mean(cw["avg255"])), 3) if sk == "ALL" else "",
+                            round(float(np.mean(cw["max255"])), 2) if sk == "ALL" else "",
+                            round(float(np.mean(cw["l2"])), 4) if sk == "ALL" else ""])
+        print(f"Saved {cw_path}")
 
     # ---- charts ----
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     styles = {"noise": ("gray", ":", "o"), "fgsm": ("tab:blue", "-", "s"), "pgd": ("tab:red", "--", "^")}
-    charts = [("detection_rate", "kept", "Signs still detected correctly")]
+    charts = [("attack_success", "success", "Attack success rate"),
+              ("detection_rate", "kept", "Signs still detected correctly")]
     if args.goal == "swap":
-        charts.append(("flip_rate", "flipped", "Speed limits switched (35 <-> 45)"))
+        charts.append(("flip_rate", "flipped", "Signs read as a different sign"))
     for fname, key, ylabel in charts:
         plt.figure(figsize=(8, 5))
         for kind in ATTACK_KINDS:
-            ys = [stats[(kind, e, "ALL")][key] / stats[(kind, e, "ALL")]["signs"] for e in EPSILONS]
+            ys = [success(stats[(kind, e, "ALL")], args.goal) if key == "success" else
+                  stats[(kind, e, "ALL")][key] / stats[(kind, e, "ALL")]["signs"] for e in EPSILONS]
             c, ls, mk = styles[kind]
             plt.plot(EPSILONS, ys, color=c, linestyle=ls, marker=mk, label=kind.upper())
+        if cw:
+            plt.axhline(success(cw, args.goal) if key == "success" else cw[key] / cw["signs"],
+                        color="tab:purple", linestyle="-.",
+                        label=f"C&W (no eps, avg change {np.mean(cw['avg255']):.1f}/255)")
         plt.title(f"YOLO sign detector under attack ({args.goal.upper()} goal, {n_signs} signs)")
         plt.xlabel("Epsilon (attack strength)")
         plt.ylabel(ylabel)
@@ -237,10 +297,13 @@ def main():
     # ---- example picture ----
     if example_imgs:
         name, img, x, meta, ref = example
-        panels = [draw(img, ref, "CLEAN")] + [example_imgs[k] for k in ATTACK_KINDS if k in example_imgs]
+        panels = [draw(img, ref, "CLEAN")] + [example_imgs[k] for k in ATTACK_KINDS + ["cw"] if k in example_imgs]
         h = 360
         panels = [cv2.resize(p, (int(p.shape[1] * h / p.shape[0]), h)) for p in panels]
-        grid = np.vstack([np.hstack(panels[:2]), np.hstack(panels[2:4])]) if len(panels) == 4 else np.hstack(panels)
+        if len(panels) % 2:                       # pad to an even count so it fits 2 rows
+            panels.append(np.zeros_like(panels[0]))
+        half = len(panels) // 2
+        grid = np.vstack([np.hstack(panels[:half]), np.hstack(panels[half:])])
         path = out_dir / f"examples_{args.goal}_eps{EXAMPLE_EPS:.2f}.png"
         cv2.imwrite(str(path), grid)
         print(f"Saved {path}")
