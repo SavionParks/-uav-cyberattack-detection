@@ -1,0 +1,5 @@
+1. How does a CNN "see" an image differently than we do — what exactly are the convolutional filters detecting at each layer?
+2. Why do we resize/crop images to a fixed size (like 64x64) before feeding them into the model, and what do we lose or gain by choosing a smaller vs. larger crop size?
+3.What's the difference between how we preprocess images for training vs. how an adversarial attack manipulates them afterward?
+
+If he can type in this notepad or anyone that explains this.
